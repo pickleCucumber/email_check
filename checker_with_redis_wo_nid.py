@@ -136,7 +136,7 @@ def get_email_data(db: Session, record_id: int):
         WHERE Id = :id
     """)
     row = db.execute(query, {"id": record_id}).fetchone()
-    if not row or row.Status != "in_the_queue":
+    if not row or row.Status != "in_queue":
         return None
     return (row.Email, row.Subject, row.Body)
 
@@ -285,7 +285,22 @@ def process_task(task: dict):
         db.close()
         task_end = time.time()
         logger.info(f"[{task_end}] process_task END for {record_id}, duration {task_end - task_start:.3f}s")
-# ---------- блокирующее чтение из очереди ----------
+
+# ---------- загрузка ожидающих писем из БД ----------
+def fetch_pending_emails_from_db():
+    """Возвращает список ID записей со статусом 'in_queue '."""
+    db = next(get_db())
+    try:
+        query = text("SELECT Id FROM EmailCheckQueue WHERE Status = 'in_queue '")
+        rows = db.execute(query).fetchall()
+        return [row.Id for row in rows]
+    except Exception as e:
+        logger.error(f"Error fetching pending emails from DB: {e}")
+        return []
+    finally:
+        db.close()
+
+# ---------- основной цикл ----------
 def main():
     # фоновый монитор bounce
     bounce_thread = threading.Thread(target=bounce_monitor_loop, daemon=True)
@@ -296,13 +311,22 @@ def main():
             # блокируемся до появления задания в очереди
             result = redis_client.blpop(QUEUE_NAME, timeout=5)
             if result is None:
-                logger.info("No tasks in queue, waiting...")
+                logger.info("No tasks in queue, checking database for pending emails...")
+                pending_ids = fetch_pending_emails_from_db()
+                if pending_ids:
+                    for record_id in pending_ids:
+                        task = {"record_id": record_id, "retries": 0}
+                        redis_client.rpush(QUEUE_NAME, json.dumps(task))
+                    logger.info(f"Added {len(pending_ids)} pending emails from database to queue")
+                else:
+                    logger.info("No pending emails in database")
                 continue
-            if result:
-                _, task_json = result
-                logger.info(f"[{time.time()}] Got task from queue")
-                task = json.loads(task_json)
-                executor.submit(process_task, task)
+
+            # задача получена из очереди
+            _, task_json = result
+            logger.info(f"[{time.time()}] Got task from queue")
+            task = json.loads(task_json)
+            executor.submit(process_task, task)
 
 if __name__ == "__main__":
     try:
