@@ -56,11 +56,11 @@ BOUNCE_KEYWORDS = {
 }
 
 # ---------- redis ----------
-
 redis_client = redis_client
 
 QUEUE_NAME = "email_queue"
-BOUNCE_PENDING = "hash_bounce_pending"   # хэш: probe_id -> {record_id, attempts}
+BOUNCE_PENDING = "hash_bounce_pending"
+SENT_EMAILS = "hash_sent_emails"  # record_id -> probe_id (уже отправленные)
 
 # ---------- функции ----------
 def syntax_valid(email_addr: str) -> bool:
@@ -99,7 +99,7 @@ def smtp_probe(email_addr: str, mx: str) -> str:
 
 def send_probe(email_addr: str, subject: str, body: str, probe_id: str) -> bool:
     try:
-        msg = MIMEText(body, "plain", "utf-8")
+        msg = MIMEText(body, "html", "utf-8")
         msg["Subject"] = subject
         msg["From"] = FROM_EMAIL
         msg["To"] = email_addr
@@ -158,11 +158,27 @@ def update_record_result(db: Session, record_id: int, status: str, reason: str =
     db.commit()
     logger.info(f"Record {record_id} -> {status}: {reason}")
 
+# ---------- ГЛАВНАЯ ФУНКЦИЯ: ПРОВЕРИТЬ ОТПРАВЛЕНО ЛИ УЖЕ ----------
+def is_email_already_sent(record_id: int) -> str:
+    """
+    Проверить, отправлено ли письмо уже.
+    Возвращает probe_id если отправлено, None если нет
+    """
+    probe_id = redis_client.hget(SENT_EMAILS, record_id)
+    if probe_id:
+        logger.info(f"Record {record_id} already sent with probe_id {probe_id.decode()}")
+        return probe_id.decode()
+    return None
+
+def mark_email_as_sent(record_id: int, probe_id: str):
+    """Отметить письмо как отправленное в Redis"""
+    redis_client.hset(SENT_EMAILS, record_id, probe_id)
+    logger.info(f"Record {record_id} marked as sent with probe_id {probe_id}")
+
 # ---------- bounce мониторинг асинхронный ----------
 def register_bounce_check(record_id: int, probe_id: str):
     data = {"record_id": record_id, "attempts": 0}
     redis_client.hset(BOUNCE_PENDING, probe_id, json.dumps(data))
-
 
 def check_bounce_for_probe(probe_id: str):
     try:
@@ -170,16 +186,13 @@ def check_bounce_for_probe(probe_id: str):
         mail.login(IMAP_USER, IMAP_PASS)
         mail.select("Inbox")
 
-        # ищем по заголовку
         search_criteria = f'HEADER Original-Message-ID "<{probe_id}@paylate.su>"'
         typ, ids = mail.uid('SEARCH', None, search_criteria)
         if typ != 'OK' or not ids[0]:
-            #  ищем в теле
             search_criteria = f'TEXT "{probe_id}"'
             typ, ids = mail.uid('SEARCH', None, search_criteria)
 
         if typ == 'OK' and ids[0]:
-            # первое найденное письмо
             uid = ids[0].split()[0]
             typ, msg_data = mail.uid('FETCH', uid, '(RFC822)')
             if typ == 'OK':
@@ -204,16 +217,20 @@ def process_all_pending_bounces():
         bounced, reason = check_bounce_for_probe(probe_id)
         if bounced:
             db = next(get_db())
-            update_record_result(db, record_id, "invalid", f"Bounce: {reason}")
-            db.close()
+            try:
+                update_record_result(db, record_id, "invalid", f"Bounce: {reason}")
+            finally:
+                db.close()
             to_delete.append(probe_id)
             continue
 
         attempts += 1
         if attempts >= MAX_BOUNCE_CHECKS:
             db = next(get_db())
-            update_record_result(db, record_id, "valid", "Delivered (no bounce)")
-            db.close()
+            try:
+                update_record_result(db, record_id, "valid", "Delivered (no bounce)")
+            finally:
+                db.close()
             to_delete.append(probe_id)
         else:
             data["attempts"] = attempts
@@ -224,19 +241,26 @@ def process_all_pending_bounces():
 
 def bounce_monitor_loop():
     while True:
-        process_all_pending_bounces()
+        try:
+            process_all_pending_bounces()
+        except Exception as e:
+            logger.error(f"Error in bounce_monitor_loop: {e}")
         time.sleep(BOUNCE_CHECK_INTERVAL)
 
-# ---------- поток ----------
+# ---------- ОСНОВНОЙ ПОТОК ОБРАБОТКИ ----------
 def process_task(task: dict):
     task_start = time.time()
     record_id = task["record_id"]
     logger.info(f"[{task_start}] process_task START for {record_id}")
     retries = task.get("retries", 0)
 
-
     db = next(get_db())
     try:
+        existing_probe_id = is_email_already_sent(record_id)
+        if existing_probe_id:
+            logger.info(f"Email {record_id} already sent. Checking bounce for probe_id {existing_probe_id}")
+            return
+
         email_data = get_email_data(db, record_id)
         if not email_data:
             logger.info(f"Record {record_id} already processed or missing, skipping")
@@ -258,17 +282,23 @@ def process_task(task: dict):
         mx = mx_records[0]
         smtp_result = smtp_probe(email, mx)
 
-        # if SMTP сказал "invalid" – отклоняем сразу
         if smtp_result == "invalid":
             update_record_result(db, record_id, "invalid", "SMTP rejected")
             return
 
-        # отправляем письмо
+  
         probe_id = str(uuid.uuid4())
         if not send_probe(email, subject, body, probe_id):
-            update_record_result(db, record_id, "invalid", "Failed to send probe")
+            update_record_result(db, record_id, "failed", "Failed to send probe", is_sent=False)
             return
 
+
+        mark_email_as_sent(record_id, probe_id)
+        
+
+        update_record_result(db, record_id, "sent", None, is_sent=True)
+        
+ 
         register_bounce_check(record_id, probe_id)
         logger.info(f"Probe sent for {email} (record {record_id}, probe_id={probe_id})")
 
@@ -280,18 +310,21 @@ def process_task(task: dict):
             logger.warning(f"Re-queued record {record_id}, attempt {task['retries']}")
         else:
             logger.error(f"Record {record_id} exceeded max retries, marking as failed")
-            update_record_result(db, record_id, "failed", "Max retries exceeded", is_sent=False)
+            try:
+                update_record_result(db, record_id, "failed", "Max retries exceeded", is_sent=False)
+            except Exception as e:
+                logger.error(f"Failed to update record {record_id}: {e}")
     finally:
         db.close()
         task_end = time.time()
+        time.sleep(1)
         logger.info(f"[{task_end}] process_task END for {record_id}, duration {task_end - task_start:.3f}s")
+        
 
-# ---------- загрузка ожидающих писем из БД ----------
 def fetch_pending_emails_from_db():
-    """Возвращает список ID записей со статусом 'in_queue '."""
     db = next(get_db())
     try:
-        query = text("SELECT Id FROM EmailCheckQueue WHERE Status = 'in_queue '")
+        query = text("SELECT Id FROM EmailCheckQueue WHERE Status = 'in_queue'")
         rows = db.execute(query).fetchall()
         return [row.Id for row in rows]
     except Exception as e:
@@ -300,15 +333,15 @@ def fetch_pending_emails_from_db():
     finally:
         db.close()
 
-# ---------- основной цикл ----------
 def main():
-    # фоновый монитор bounce
+    logger.info("Email validator started")
+    
     bounce_thread = threading.Thread(target=bounce_monitor_loop, daemon=True)
     bounce_thread.start()
+    logger.info("Bounce monitor thread started")
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         while True:
-            # блокируемся до появления задания в очереди
             result = redis_client.blpop(QUEUE_NAME, timeout=5)
             if result is None:
                 logger.info("No tasks in queue, checking database for pending emails...")
@@ -322,7 +355,6 @@ def main():
                     logger.info("No pending emails in database")
                 continue
 
-            # задача получена из очереди
             _, task_json = result
             logger.info(f"[{time.time()}] Got task from queue")
             task = json.loads(task_json)
